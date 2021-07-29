@@ -1,9 +1,3 @@
-# This is a sample Python script.
-
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
-
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 import boto3
@@ -17,6 +11,10 @@ db='os-nvidia-dev'
 tbl='gpu'
 
 def proc_scrape():
+    """
+    calls an exposed prometheus exporter on LAN and gets all the nvidia metrics
+    :return: status of the push to TimeStream
+    """
     metrics = requests.get('http://192.168.2.151:9445/metrics').text
     collection_ts = int(datetime.utcnow().timestamp())
     records=[]
