@@ -1,0 +1,82 @@
+# Basic Grafana configuration with separate PostgreSQL database
+#
+# WARNING: This configuration is for local development. Do not use it in a production deployment.
+#
+# This configuration supports basic configuration using environment variables or an .env file
+# The following variables are supported:
+#
+# GRAFANA_IMAGE_NAME           - Docker image name used to run GRAFANA.
+#                                Default: grafana/grafana:6.5.0-ubuntu
+#
+# Those configurations are useful mostly in case of standalone testing/running GRAFANA in test/try-out mode
+#
+# _GRAFANA_WWW_USER_USERNAME   - Username for the administrator account (if requested).
+#                                Default: GRAFANA
+# _GRAFANA_WWW_USER_PASSWORD   - Password for the administrator account (if requested).
+#                                Default: GRAFANA
+# _PIP_ADDITIONAL_REQUIREMENTS - Additional PIP requirements to add when starting all containers.
+#                                Default: ''
+#
+# Feel free to modify this file to suit your needs.
+---
+version: '3'
+x-grafana-common:
+  &grafana-common
+  image: ${AIRFLOW_IMAGE_NAME:-grafana/grafana:8.1.1-ubuntu}
+  environment:
+    &grafana-common-env
+    #_PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    GF_DEFAULT_INSTANCE_NAME: os-ha-grafana
+    GF_SECURITY_ADMIN_USER: optus
+    GF_SECURITY_ADMIN_PASSWORD: optus
+    #GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: true
+    GF_DATABASE_TYPE: postgres
+    GF_DATABASE_URL: postgres://grafana:grafana@postgres/grafana
+    GF_AWS_ALLOWED_AUTH_PROVIDERS: ec2_iam_role
+    
+
+
+  #volumes:
+    #- ./dags:/opt/airflow/dags
+    #- ./logs:/opt/airflow/logs
+    #- ./plugins:/opt/airflow/plugins
+    #- ./requirements.txt:/tmp/requirements.txt
+    #- $HOME/.aws/credentials:/home/airflow/.aws/credentials:ro ## mount your default host .aws creds so that the docker images can connect to AWS
+  #user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-50000}"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  
+
+services:
+  postgres:
+    image: postgres:13
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: grafana
+      POSTGRES_PASSWORD: grafana
+      POSTGRES_DB: grafana
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "grafana"]
+      interval: 5s
+      retries: 5
+    restart: always
+
+  grafana-init:
+    <<: *grafana-common
+    command: version
+    ports:
+      - 3000:3000
+    environment:
+      <<: *grafana-common-env
+      #_GRAFANA_DB_UPGRADE: 'true'
+      #_GRAFANA_WWW_USER_CREATE: 'true'
+      #_GRAFANA_WWW_USER_USERNAME: ${_GRAFANA_WWW_USER_USERNAME:-grafana}
+      #_GRAFANA_WWW_USER_PASSWORD: ${_GRAFANA_WWW_USER_PASSWORD:-grafana}
+
+
+volumes:
+  postgres-db-volume:

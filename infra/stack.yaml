@@ -1,0 +1,280 @@
+Description: >
+  This template deploys Grafana to an AWS Fargate Cluster on our MWAA VPC (pub subnets for now, need to switch it out into private later). 
+  An ECS Service ensures Grafana continues to run on the created Cluster. Logging is captured within CloudWatch.
+Parameters:
+  VpcId:
+    Description: The VPC to which this cluster should be deployed
+    Type: AWS::EC2::VPC::Id
+  GrafanaSubnets:
+    Description: Choose at least two subnets in this VPC, deploy this on the pub side for dev but move to priv for prod
+    Type: List<AWS::EC2::Subnet::Id>
+  GrafanaSubnetACidrs:
+    Description: Match this to GrafanaSubnets
+    Type: String
+    Default: 10.192.11.0/24
+  GrafanaSubnetBCidrs:
+    Description: Match this to GrafanaSubnets
+    Type: String
+    Default: 10.192.10.0/24
+  AuroraSubnets:
+    Description: Choose at least two subnets in this VPC, backend db needs to be in private range
+    Type: List<AWS::EC2::Subnet::Id>
+  GrafanaRAM:
+    Type: Number
+    Default: 512
+  GrafanaCPU:
+    Type: Number
+    Default: 256
+  GrafanaPort:
+    Type: Number
+    Default: 3000
+  GrafanaImage:
+    Description: Pulled from the public Docker image for Grafana (https://hub.docker.com/r/grafana/grafana/)
+    Type: String
+    Default: grafana/grafana
+  BackendUser:
+    Type: String
+    Default: optussport
+  BackendUserPwd:
+    Type: String
+    Default: derpyderp#2021 ## definitely get rid of this in prod lol
+  TimeStreamDBName:
+    Type: String
+    Default: os-nvidia-dev
+
+Resources:
+  GrafanaECSExecutionRole:
+    Type: AWS::IAM::Role
+    #DependsOn: AuroraServerlessCluster
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+      Policies: 
+        - PolicyName: gets3config
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:GetObject
+                Resource:  arn:aws:s3:::os-datalake-scripts-prod/grafana-*
+
+        - PolicyName: cloudwatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+        - PolicyName: auroraconnect
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: !Sub 'arn:aws:${AWS::Region}:${AWS::AccountId}:dbuser:*/${BackendUser}'
+        - PolicyName: timestreamconnect
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:Select
+                  - timestream:DescribeTable
+                  - timestream:ListMeasures
+                Resource: !Sub 'arn:aws:timestream:us-west-2:${AWS::AccountId}:database/${TimeStreamDBName}/*'
+              - Effect: Allow
+                Action:
+                  - timestream:SelectValues
+                  - timestream:CancelQuery
+                Resource: '*'
+
+
+        
+      RoleName: !Sub ${AWS::StackName}-ecs-execution-role
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/grafana-fargate
+  
+  GrafanaDashboardAccessSecurityGroup:
+    #nothing defined here, do it manually once created, then update the template
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Allows limited access to Grafana via interwebsss
+      GroupName: !Sub ${AWS::StackName}-interwebs-access
+      VpcId: !Ref VpcId
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: Backend AuroraDB for Grafana, put this on the private side
+      GroupName: !Sub ${AWS::StackName}-aurora-backend
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: 
+        -   CidrIp: !Ref GrafanaSubnetACidrs
+            #CidrIpv6: String
+            Description: allow any from pub subnet A
+            FromPort: 5432
+            IpProtocol: tcp
+            #SourcePrefixListId: String
+            #SourceSecurityGroupId: String
+            #SourceSecurityGroupName: String
+            #SourceSecurityGroupOwnerId: String
+            ToPort: 5433
+        -   CidrIp: !Ref GrafanaSubnetBCidrs
+            #CidrIpv6: String
+            Description: allow any from pub subnet B
+            FromPort: 5432
+            IpProtocol: tcp
+            #SourcePrefixListId: String
+            #SourceSecurityGroupId: String
+            #SourceSecurityGroupName: String
+            #SourceSecurityGroupOwnerId: String
+            ToPort: 5433
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders: 
+        - FARGATE
+      ClusterName: !Sub ${AWS::StackName}
+
+
+  GrafanaTaskDef: 
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: AuroraServerlessCluster
+    Properties:
+      Family: !Sub ${AWS::StackName}-grafana
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref GrafanaECSExecutionRole
+      Memory: !Ref GrafanaRAM
+      Cpu: !Ref GrafanaCPU
+      
+      ContainerDefinitions:
+        -
+          Name: grafana-container
+          Image: !Ref GrafanaImage
+          Memory: !Ref GrafanaRAM
+          Cpu: !Ref GrafanaCPU
+          Environment:
+                - Name: GF_DEFAULT_INSTANCE_NAME
+                  Value: os-ha-grafana
+                - Name: GF_SECURITY_ADMIN_USER
+                  Value: optus
+                - Name: GF_SECURITY_ADMIN_PASSWORD
+                  Value: optus
+                - Name: GF_DATABASE_TYPE
+                  Value: postgres
+                - Name: GF_DATABASE_URL
+                  Value: !Sub 'postgres://${BackendUser}:${BackendUserPwd}@${AuroraServerlessCluster.Endpoint.Address}:${AuroraServerlessCluster.Endpoint.Port}/grafana'
+                - Name: GF_AWS_ALLOWED_AUTH_PROVIDERS
+                  Value: ec2_iam_role
+
+                #GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: true
+
+          #EnvironmentFiles:
+          #  - Type: s3
+          #    Value: arn:aws:s3:::os-datalake-scripts-prod/grafana-env/config.env
+
+          #EntryPoint: [bash]
+          #Command: 
+          #  - "-c"
+          #  - !Sub |
+          #      mkdir /opt/flink/plugins/s3-fs-hadoop && cp /opt/flink/opt/flink-s3-fs-hadoop* /opt/flink/plugins/s3-fs-hadoop
+          PortMappings:
+            -
+              ContainerPort: !Ref GrafanaPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+                awslogs-group: "/ecs/grafana-fargate"
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: "dashboard"
+
+  ServiceDefinition:
+    Type: AWS::ECS::Service
+    Properties:
+      LaunchType: FARGATE
+      TaskDefinition: !Ref GrafanaTaskDef
+      Cluster: !Ref ECSCluster
+      ServiceName: grafana-dashboard-service
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      EnableECSManagedTags: True
+
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref GrafanaSubnets
+          SecurityGroups: 
+              - !Ref GrafanaDashboardAccessSecurityGroup
+          
+  
+
+  AuroraDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: 
+      DBSubnetGroupDescription: put this in the private subnet of whatever VPC
+      DBSubnetGroupName: aurora-backend
+      SubnetIds: !Ref AuroraSubnets
+      #Tags: 
+      #  - Tag
+
+  AuroraServerlessCluster:
+    Type: AWS::RDS::DBCluster
+    Properties: 
+      #AssociatedRoles: 
+      #  - !Ref GrafanaStateBackendRole
+      BackupRetentionPeriod: 7
+      DatabaseName: grafana
+      DBClusterIdentifier: aurora-cluster-for-grafana
+      #DBClusterParameterGroupName: 
+      DBSubnetGroupName: !Ref AuroraDBSubnetGroup
+      DeletionProtection: False #change this to true in prod
+      #EnableCloudwatchLogsExports: 
+      #  - String
+      #EnableHttpEndpoint: Boolean
+      #EnableIAMDatabaseAuthentication: Boolean
+      Engine: aurora-postgresql
+      EngineMode: serverless
+      #EngineVersion: String
+      #GlobalClusterIdentifier: String
+      #KmsKeyId: String
+      MasterUsername: !Ref BackendUser
+      MasterUserPassword: !Ref BackendUserPwd
+      #Port: Integer
+      #PreferredBackupWindow: String
+      #PreferredMaintenanceWindow: String
+      #ReplicationSourceIdentifier: String
+      #RestoreType: String
+      ScalingConfiguration:
+        AutoPause: true
+        MaxCapacity: 16
+        MinCapacity: 2
+        SecondsUntilAutoPause: 300
+      #SnapshotIdentifier: String
+      #SourceDBClusterIdentifier: String
+      #SourceRegion: String
+      #StorageEncrypted: Boolean
+      #Tags: 
+      #  - Tag
+      #UseLatestRestorableTime: Boolean
+      VpcSecurityGroupIds: 
+        - !Ref AuroraSecurityGroup
